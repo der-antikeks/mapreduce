@@ -133,11 +133,15 @@ func main() {
 
 	if !master {
 		node := mapreduce.Node(Mapper, Reducer)
-		log.Printf("node connecting to %v", address)
-		if err := node.ConnectTo(address); err != nil {
-			log.Fatal(err)
+		for { // auto-reconnect
+			log.Printf("node connecting to %v", address)
+			err := node.ConnectTo(address)
+			if err == nil {
+				log.Println("finished")
+				return
+			}
+			log.Println(err)
 		}
-		return
 	}
 
 	in := merge(InputReader("inputa.txt"), InputReader("inputb.txt"))

@@ -1,29 +1,31 @@
 package mapreduce
 
 import (
-	"encoding/gob"
 	"fmt"
 	"hash/adler32"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"sync"
 )
 
 type master struct {
 	in  <-chan Pair
+	m2r chan Pair
 	out chan<- Pair
 
-	nodes    map[string]io.ReadWriteCloser
+	nodes    map[io.ReadWriteCloser]chan interface{}
+	reducers map[interface{}]chan interface{}
 	nodeLock sync.RWMutex
 }
 
 func Master(in <-chan Pair, out chan<- Pair) *master {
 	return &master{
-		in:    in,
-		out:   out,
-		nodes: make(map[string]io.ReadWriteCloser),
+		in:       in,
+		m2r:      make(chan Pair),
+		out:      out,
+		nodes:    make(map[io.ReadWriteCloser]chan interface{}),
+		reducers: make(map[interface{}]chan interface{}),
 	}
 }
 
@@ -33,54 +35,112 @@ func (m *master) ListenAt(address string) error {
 		return err
 	}
 
+	done := make(chan struct{})
+	defer close(done)
+
+	// mapped pair key to reducer
+	go func() {
+		for p := range m.m2r {
+			key := p.Key
+			c, ok := m.reducers[key]
+			if !ok {
+				c = make(chan interface{})
+				m.reducers[key] = c
+			}
+			c <- p.Value
+		}
+	}()
+
 	for {
 		c, err := l.Accept()
 		if err != nil {
 			return err
 		}
 
-		go m.handle(c, c.RemoteAddr().String())
+		go m.handle(c, c.RemoteAddr().String(), done)
 	}
 
 	return nil
 }
 
-func (m *master) handle(c io.ReadWriteCloser, addr string) {
+func (m *master) handle(conn io.ReadWriteCloser, addr string, done <-chan struct{}) {
 	log.Println("node connected from", addr)
 
 	m.nodeLock.Lock()
-	m.nodes[addr] = c
+	red := make(chan interface{})
+	m.nodes[conn] = red
 	m.nodeLock.Unlock()
 
-	enc := gob.NewEncoder(c)
-
-	// TODO: map
-	for i := 0; i < 100; i++ {
-		value := ""
-
-		for p := 0; p <= rand.Intn(100); p++ {
-			value = fmt.Sprintf("%v %c", value, rand.Intn(122-97)+97+1)
+	// reducer to node
+	go func() {
+		// TODO: partition
+		// TODO-TODO: this doesn't even work yet...
+		for _, r := range m.reducers {
+			go func(in <-chan interface{}) {
+				for p := range in {
+					red <- p
+				}
+			}(r)
 		}
+	}()
 
-		if err := enc.Encode(Message{"tomap", Pair{"a", value}}); err != nil {
-			log.Fatal("encode error:", err)
-		}
-	}
+	send := make(chan Message)
+	recv, errc := netchan(conn, done, send)
 
-	// TODO: reduce
-	for i := 0; i < 100; i++ {
-		value := fmt.Sprintf("%c", rand.Intn(122-97)+97+1)
-		if err := enc.Encode(Message{"tored", Pair{value, 1}}); err != nil {
-			log.Fatal("encode error:", err)
+	// receive loop
+	go func() {
+		for msg := range recv {
+			switch msg.Type {
+			case "mapped":
+				p := msg.Payload.(Pair)
+				log.Println("received mapped", p)
+				m.m2r <- p
+			case "reduced":
+				p := msg.Payload.(Pair)
+				log.Println("received reduced", p)
+				m.out <- p
+			default:
+				log.Println("unknown node message", msg)
+			}
 		}
+	}()
+
+	// mapping loop
+	go func() {
+		for p := range m.in {
+			log.Printf("sending map %v to client %v\n", p, addr)
+			send <- Message{"map", p}
+		}
+	}()
+
+	// reducing loop
+	go func() {
+		for value := range red {
+			log.Printf("sending reduce %v to client %v\n", value, addr)
+			send <- Message{"reduce", Pair{value, 1}}
+		}
+	}()
+
+	<-done
+
+	// shutdown node
+	send <- Message{"quit", nil}
+
+	// handle error, recv is closed on error
+	select {
+	case err := <-errc:
+		if err != nil {
+			log.Fatal(err)
+		}
+	default:
 	}
 
 	m.nodeLock.Lock()
-	delete(m.nodes, addr)
+	delete(m.nodes, conn)
 	m.nodeLock.Unlock()
 
 	log.Println("disconnecting node", addr)
-	c.Close()
+	conn.Close()
 }
 
 func (m *master) partition(key interface{}) int {
