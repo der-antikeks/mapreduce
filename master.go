@@ -9,24 +9,57 @@ import (
 	"sync"
 )
 
-type master struct {
-	in  <-chan Pair
-	m2r chan Pair
-	out chan<- Pair
+type connection struct {
+	c io.ReadWriteCloser
+	r chan interface{}
+}
 
-	nodes    map[io.ReadWriteCloser]chan interface{}
-	reducers map[interface{}]chan interface{}
+type master struct {
+	in   <-chan Pair
+	part chan Pair
+	out  chan<- Pair
+
+	nodes    []*connection
+	reducers map[interface{}]int
 	nodeLock sync.RWMutex
 }
 
 func Master(in <-chan Pair, out chan<- Pair) *master {
-	return &master{
-		in:       in,
-		m2r:      make(chan Pair),
-		out:      out,
-		nodes:    make(map[io.ReadWriteCloser]chan interface{}),
-		reducers: make(map[interface{}]chan interface{}),
+	m := &master{
+		in:   in,
+		part: make(chan Pair),
+		out:  out,
+		//nodes:    make([]*connection),
+		reducers: make(map[interface{}]int),
 	}
+
+	// Mapper to Partitioner
+	// TODO: make less ugly!
+	go func() {
+		for p := range m.part {
+			key := p.Key
+			n, found := m.reducers[key]
+			if !found {
+				m.nodeLock.Lock()
+				numReducers := len(m.nodes)
+
+				h := adler32.New()
+				h.Write([]byte(fmt.Sprintf("%v", key)))
+				n = int(h.Sum32()) % numReducers
+				m.reducers[key] = n
+
+				m.nodeLock.Unlock()
+			}
+			m.nodes[n].r <- p
+		}
+		// TODO: Doh! nobody closes m.part...
+
+		for _, n := range m.nodes {
+			close(n.r)
+		}
+	}()
+
+	return m
 }
 
 func (m *master) ListenAt(address string) error {
@@ -35,95 +68,79 @@ func (m *master) ListenAt(address string) error {
 		return err
 	}
 
-	done := make(chan struct{})
-	defer close(done)
-
-	// mapped pair key to reducer
-	go func() {
-		for p := range m.m2r {
-			key := p.Key
-			c, ok := m.reducers[key]
-			if !ok {
-				c = make(chan interface{})
-				m.reducers[key] = c
-			}
-			c <- p.Value
-		}
-	}()
-
 	for {
 		c, err := l.Accept()
 		if err != nil {
 			return err
 		}
 
-		go m.handle(c, c.RemoteAddr().String(), done)
+		go m.handle(c, c.RemoteAddr().String())
 	}
 
 	return nil
 }
 
-func (m *master) handle(conn io.ReadWriteCloser, addr string, done <-chan struct{}) {
+func (m *master) handle(conn io.ReadWriteCloser, addr string) {
 	log.Println("node connected from", addr)
+	var wg sync.WaitGroup
+	wg.Add(3)
 
-	m.nodeLock.Lock()
-	red := make(chan interface{})
-	m.nodes[conn] = red
-	m.nodeLock.Unlock()
-
-	// reducer to node
-	go func() {
-		// TODO: partition
-		// TODO-TODO: this doesn't even work yet...
-		for _, r := range m.reducers {
-			go func(in <-chan interface{}) {
-				for p := range in {
-					red <- p
-				}
-			}(r)
-		}
-	}()
-
+	// create netchan
+	done := make(chan struct{})
 	send := make(chan Message)
 	recv, errc := netchan(conn, done, send)
+	defer close(done)
 
-	// receive loop
+	// InputReader to Mapper
 	go func() {
+		defer wg.Done()
+		for p := range m.in {
+			log.Println("master -> node: map")
+			send <- Message{"map", p}
+		}
+		log.Println("master -> node: mapdone")
+		send <- Message{"mapdone", nil}
+	}()
+
+	// Partitioner to Reducer
+	m.nodeLock.Lock()
+	red := make(chan interface{})
+	m.nodes = append(m.nodes, &connection{conn, red})
+	m.nodeLock.Unlock()
+
+	go func() {
+		defer wg.Done()
+		for p := range red {
+			log.Println("master -> node: reduce")
+			send <- Message{"reduce", p}
+		}
+		log.Println("master -> node: reducedone")
+		send <- Message{"reducedone", nil}
+	}()
+
+	// receive messages
+	go func() {
+		defer wg.Done()
 		for msg := range recv {
+			log.Println("node -> master:", msg.Type)
+
 			switch msg.Type {
 			case "mapped":
-				p := msg.Payload.(Pair)
-				log.Println("received mapped", p)
-				m.m2r <- p
+				m.part <- msg.Payload.(Pair)
 			case "reduced":
-				p := msg.Payload.(Pair)
-				log.Println("received reduced", p)
-				m.out <- p
+				m.out <- msg.Payload.(Pair)
+			case "done":
+				return
 			default:
-				log.Println("unknown node message", msg)
+				log.Printf("unknown message %v from node %v\n", msg, addr)
 			}
 		}
 	}()
 
-	// mapping loop
-	go func() {
-		for p := range m.in {
-			log.Printf("sending map %v to client %v\n", p, addr)
-			send <- Message{"map", p}
-		}
-	}()
-
-	// reducing loop
-	go func() {
-		for value := range red {
-			log.Printf("sending reduce %v to client %v\n", value, addr)
-			send <- Message{"reduce", Pair{value, 1}}
-		}
-	}()
-
-	<-done
+	wg.Wait()
 
 	// shutdown node
+	log.Println("master -> node: quit")
 	send <- Message{"quit", nil}
 
 	// handle error, recv is closed on error
@@ -135,20 +152,20 @@ func (m *master) handle(conn io.ReadWriteCloser, addr string, done <-chan struct
 	default:
 	}
 
+	// TODO: make less ugly!
 	m.nodeLock.Lock()
-	delete(m.nodes, conn)
+	//delete(m.nodes, conn)
+	for i, c := range m.nodes {
+		if c.c == conn {
+			copy(m.nodes[i:], m.nodes[i+1:])
+			m.nodes[len(m.nodes)-1] = nil
+			m.nodes = m.nodes[:len(m.nodes)-1]
+
+			break
+		}
+	}
 	m.nodeLock.Unlock()
 
 	log.Println("disconnecting node", addr)
 	conn.Close()
-}
-
-func (m *master) partition(key interface{}) int {
-	m.nodeLock.RLock()
-	numReducers := len(m.nodes)
-	m.nodeLock.RUnlock()
-
-	h := adler32.New()
-	h.Write([]byte(fmt.Sprintf("%v", key)))
-	return int(h.Sum32()) % numReducers
 }

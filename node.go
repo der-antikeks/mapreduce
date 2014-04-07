@@ -3,6 +3,7 @@ package mapreduce
 import (
 	"log"
 	"net"
+	"sync"
 )
 
 type node struct {
@@ -24,35 +25,86 @@ func (n *node) ConnectTo(address string) error {
 	}
 	defer conn.Close()
 
-	done := make(chan struct{})
-	defer close(done)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
+	// create netchan
+	done := make(chan struct{})
 	send := make(chan Message)
 	recv, errc := netchan(conn, done, send)
+	defer close(done)
 
 	// mapping loop
 	domap := make(chan Pair)
-	frommap := n.mapper(domap)
 	go func() {
-		for p := range frommap {
-			log.Println("mapped", p)
+		defer wg.Done()
+
+		for p := range n.mapper(domap) {
+			log.Println("node -> master: mapped")
 			send <- Message{"mapped", p}
 		}
 	}()
 
-	// receive loop
+	// reducer loop
+	dored := make(chan Pair)
+	go func() {
+		defer wg.Done()
+		red := make(map[interface{}]chan interface{})
+		var wgRed sync.WaitGroup
+
+		for p := range dored {
+			key := p.Key
+			c, found := red[key]
+			if !found {
+				// create new reducer
+				c = make(chan interface{})
+				red[key] = c
+
+				wgRed.Add(1)
+				go func(key interface{}, in <-chan interface{}) {
+					defer wgRed.Done()
+					for p := range n.reducer(key, in) {
+						log.Println("node -> master: reduced")
+						send <- Message{"reduced", p}
+					}
+				}(key, c)
+			}
+			c <- p.Value
+		}
+
+		for _, c := range red {
+			close(c)
+		}
+
+		wgRed.Wait()
+	}()
+
+	// wait for mapper/reducer to finish
+	go func() {
+		wg.Wait()
+		log.Println("node -> master: done")
+		send <- Message{"done", nil}
+	}()
+
+	// receive messages
 	for msg := range recv {
+		log.Println("master -> node:", msg.Type)
+
 		switch msg.Type {
 		case "map":
-			p := msg.Payload.(Pair)
-			log.Println("received map", p)
-			domap <- p
+			domap <- msg.Payload.(Pair)
+		case "mapdone":
+			close(domap)
+
 		case "reduce":
-			log.Println("received reduce", msg)
+			dored <- msg.Payload.(Pair)
+		case "reducedone":
+			close(dored)
+
 		case "quit":
-			return nil
+			break
 		default:
-			log.Println("unknown master message", msg)
+			log.Printf("unknown message %v from master %v\n", msg, address)
 		}
 	}
 
